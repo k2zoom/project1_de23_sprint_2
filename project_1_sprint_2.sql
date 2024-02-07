@@ -148,7 +148,7 @@ WHEN NOT MATCHED THEN
   INSERT (product_id, craftsman_id, customer_id, order_created_date, order_completion_date, order_status, load_dttm)
   VALUES (t.product_id, t.craftsman_id, t.customer_id, t.order_created_date, t.order_completion_date, t.order_status, current_timestamp);
   
-DROP TABLE IF EXISTS dwh.craftsman_report_datamart;
+DROP TABLE IF EXISTS dwh.customer_report_datamart;
 
 CREATE TABLE IF NOT EXISTS dwh.customer_report_datamart (
     id BIGINT GENERATED ALWAYS AS IDENTITY NOT NULL, -- идентификатор записи
@@ -172,4 +172,297 @@ CREATE TABLE IF NOT EXISTS dwh.customer_report_datamart (
     report_customer_period VARCHAR NOT NULL, -- отчётный период (год и месяц)
     CONSTRAINT customer_report_datamart_pk PRIMARY KEY (id)
 ); 
+
+DROP TABLE IF EXISTS dwh.load_dates_customer_report_datamart;
+
+CREATE TABLE IF NOT EXISTS dwh.load_dates_customer_report_datamart (
+    id BIGINT GENERATED ALWAYS AS IDENTITY NOT NULL,
+    load_dttm DATE NOT NULL,
+    CONSTRAINT load_dates_customer_report_datamart_pk PRIMARY KEY (id));
+   
+   
+   
+WITH
+dwh_customer_delta AS ( -- определяем, какие данные были изменены в витрине или добавлены в DWH. Формируем дельту изменений
+    SELECT     
+            dcs.customer_id AS customer_id,
+            dcs.customer_name AS customer_name,
+            dcs.customer_address AS customer_address,
+            dcs.customer_birthday AS customer_birthday,
+            dcs.customer_email AS customer_email,
+            fo.order_id AS order_id,
+            dp.product_id AS product_id,
+            dp.product_price AS product_price,
+            dp.product_type AS product_type,
+            dc.craftsman_id as craftsman_id,
+            fo.order_completion_date - fo.order_created_date AS diff_order_date, 
+            fo.order_status AS order_status,
+            TO_CHAR(fo.order_created_date, 'yyyy-mm') AS report_customer_period,
+            crd.customer_id AS exist_customer_id,
+            dc.load_dttm AS craftsman_load_dttm,   
+            dcs.load_dttm AS customers_load_dttm,
+            dp.load_dttm AS products_load_dttm
+            FROM dwh.f_order fo 
+                INNER JOIN dwh.d_craftsman dc ON fo.craftsman_id = dc.craftsman_id 
+                INNER JOIN dwh.d_customer dcs ON fo.customer_id = dcs.customer_id 
+                INNER JOIN dwh.d_product dp ON fo.product_id = dp.product_id 
+                LEFT JOIN dwh.customer_report_datamart crd ON dcs.customer_id = crd.customer_id
+                    WHERE (fo.load_dttm > (SELECT COALESCE(MAX(load_dttm),'1900-01-01') FROM dwh.load_dates_craftsman_report_datamart)) OR
+                            (dc.load_dttm > (SELECT COALESCE(MAX(load_dttm),'1900-01-01') FROM dwh.load_dates_craftsman_report_datamart)) OR
+                            (dcs.load_dttm > (SELECT COALESCE(MAX(load_dttm),'1900-01-01') FROM dwh.load_dates_craftsman_report_datamart)) OR
+                            (dp.load_dttm > (SELECT COALESCE(MAX(load_dttm),'1900-01-01') FROM dwh.load_dates_craftsman_report_datamart))
+),
+
+dwh_update_delta AS ( -- делаем выборку покупателей, по которым были изменения в DWH. По этим покупателям данные в витрине нужно будет обновить
+    SELECT     
+            dd.exist_customer_id AS customer_id
+            FROM dwh_customer_delta dd 
+                WHERE dd.exist_customer_id IS NOT NULL        
+),
+ dwh_delta_insert_result AS ( -- делаем расчёт витрины по новым данным. Этой информации по мастерам в рамках расчётного периода раньше не было, это новые данные. Их можно просто вставить (insert) в витрину без обновления
+    SELECT  
+            T4.customer_id AS customer_id,
+            T4.customer_name AS customer_name,
+            T4.customer_address AS customer_address,
+            T4.customer_birthday AS customer_birthday,
+            T4.customer_email AS customer_email,
+            T4.customer_money AS customer_money,
+            T4.platform_customer_money AS platform_customer_money,
+            T4.count_customer_order AS count_customer_order,
+            T4.avg_price_customer_order AS avg_price_customer_order,
+           	T4.top_product_customer_category as top_product_customer_category,
+            t4.top_craftsman_customer as top_craftsman_customer,
+            T4.product_type AS top_product_category,
+            T4.median_time_customer_order_completed AS median_time_customer_order_completed,
+            T4.count_customer_order_created AS count_customer_order_created,
+            T4.count_customer_order_in_progress AS count_customer_order_in_progress,
+            T4.count_customer_order_delivery AS count_customer_order_delivery,
+            T4.count_customer_order_done AS count_customer_order_done,
+            T4.count_customer_order_not_done AS count_customer_order_not_done,
+            T4.report_customer_period AS report_customer_period 
+            FROM (
+                SELECT     -- в этой выборке объединяем две внутренние выборки по расчёту столбцов витрины и применяем оконную функцию для определения самой популярной категории товаров
+                        *,
+                      RANK() OVER(PARTITION BY T2.customer_id ORDER BY count_product DESC) AS top_product_customer_category 
+                        FROM ( 
+                           		SELECT -- в этой выборке делаем расчёт по большинству столбцов, так как все они требуют одной и той же группировки, кроме столбца с самой популярной категорией товаров у мастера. Для этого столбца сделаем отдельную выборку с другой группировкой и выполним JOIN
+                                T1.customer_id AS customer_id,
+                                T1.customer_name AS customer_name,
+                                T1.customer_address AS customer_address,
+                                T1.customer_birthday AS customer_birthday,
+                                T1.customer_email AS customer_email,
+                                SUM(T1.product_price) customer_money,
+                                SUM(T1.product_price) * 0.1 AS platform_customer_money,
+                                COUNT(order_id) AS count_customer_order,
+                                AVG(T1.product_price) AS avg_price_customer_order,
+                                PERCENTILE_CONT(0.5) WITHIN GROUP(ORDER BY diff_order_date) AS median_time_customer_order_completed,
+                                SUM(CASE WHEN T1.order_status = 'created' THEN 1 ELSE 0 END) AS count_customer_order_created,
+                                SUM(CASE WHEN T1.order_status = 'in progress' THEN 1 ELSE 0 END) AS count_customer_order_in_progress, 
+                                SUM(CASE WHEN T1.order_status = 'delivery' THEN 1 ELSE 0 END) AS count_customer_order_delivery, 
+                                SUM(CASE WHEN T1.order_status = 'done' THEN 1 ELSE 0 END) AS count_customer_order_done, 
+                                SUM(CASE WHEN T1.order_status != 'done' THEN 1 ELSE 0 END) AS count_customer_order_not_done,
+                                T1.report_customer_period AS report_customer_period
+                                from dwh_customer_delta AS T1
+                                WHERE T1.exist_customer_id IS NULL
+                                GROUP BY T1.customer_id, T1.customer_name, T1.customer_address, T1.customer_birthday, T1.customer_email, T1.report_customer_period
+                            ) AS T2
+                                INNER JOIN (
+                                    SELECT dd.customer_id AS customer_id_for_product_type, 
+                                            dd.product_type, 
+                                            COUNT(dd.product_id) AS count_product
+                                            FROM dwh_customer_delta AS dd
+                                                GROUP BY dd.customer_id, dd.product_type
+                                                    ORDER BY count_product DESC) AS T3 ON T2.customer_id = T3.customer_id_for_product_type
+                
+                inner join ( select craftsman_id as top_craftsman_customer,top_craftsman_customer_id  from (
+                SELECT                                             tt.customer_id AS top_craftsman_customer_id, 
+                                            tt.craftsman_id, 
+                                            row_number () over (partition by customer_id order by count(*) desc) AS top_craftsman
+                                            FROM dwh_customer_delta AS tt
+                                                GROUP BY tt.customer_id, tt.craftsman_id
+                                                    ORDER by top_craftsman  desc) yy
+                                                    where top_craftsman=1
+                                                    ) AS T5 ON T2.customer_id = T5.top_craftsman_customer_id)
+                                                    
+                                                  
+                                                    AS T4 WHERE T4.top_product_customer_category = 1  ORDER BY report_customer_period),
+
+ dwh_delta_update_result AS ( -- делаем перерасчёт для существующих записей витринs, так как данные обновились за отчётные периоды. Логика похожа на insert, но нужно достать конкретные данные из DWH
+    SELECT 
+            T4.customer_id AS customer_id,
+            T4.customer_name AS customer_name,
+            T4.customer_address AS customer_address,
+            T4.customer_birthday AS customer_birthday,
+            T4.customer_email AS customer_email,
+            T4.customer_money AS customer_money,
+            T4.platform_customer_money AS platform_customer_money,
+            T4.count_customer_order AS count_customer_order,
+            T4.avg_price_customer_order AS avg_price_customer_order,
+           	T4.top_product_customer_category as top_product_customer_category,
+            t4.top_craftsman_customer as top_craftsman_customer,
+            T4.product_type AS top_product_category,
+            T4.median_time_customer_order_completed AS median_time_customer_order_completed,
+            T4.count_customer_order_created AS count_customer_order_created,
+            T4.count_customer_order_in_progress AS count_customer_order_in_progress,
+            T4.count_customer_order_delivery AS count_customer_order_delivery,
+            T4.count_customer_order_done AS count_customer_order_done,
+            T4.count_customer_order_not_done AS count_customer_order_not_done,
+            T4.report_customer_period AS report_customer_period 
+            FROM (
+                SELECT     -- в этой выборке объединяем две внутренние выборки по расчёту столбцов витрины и применяем оконную функцию для определения самой популярной категории товаров
+                        *,
+                      RANK() OVER(PARTITION BY T2.customer_id ORDER BY count_product DESC) AS top_product_customer_category 
+                        FROM (
+                            SELECT -- в этой выборке делаем расчёт по большинству столбцов, так как все они требуют одной и той же группировки, кроме столбца с самой популярной категорией товаров у мастера. Для этого столбца сделаем отдельную выборку с другой группировкой и выполним JOIN
+                                T1.customer_id AS customer_id,
+                                T1.customer_name AS customer_name,
+                                T1.customer_address AS customer_address,
+                                T1.customer_birthday AS customer_birthday,
+                                T1.customer_email AS customer_email,
+                                SUM(T1.product_price) customer_money,
+                                SUM(T1.product_price) * 0.1 AS platform_customer_money,
+                                COUNT(order_id) AS count_customer_order,
+                                AVG(T1.product_price) AS avg_price_customer_order,
+                                PERCENTILE_CONT(0.5) WITHIN GROUP(ORDER BY diff_order_date) AS median_time_customer_order_completed,
+                                SUM(CASE WHEN T1.order_status = 'created' THEN 1 ELSE 0 END) AS count_customer_order_created,
+                                SUM(CASE WHEN T1.order_status = 'in progress' THEN 1 ELSE 0 END) AS count_customer_order_in_progress, 
+                                SUM(CASE WHEN T1.order_status = 'delivery' THEN 1 ELSE 0 END) AS count_customer_order_delivery, 
+                                SUM(CASE WHEN T1.order_status = 'done' THEN 1 ELSE 0 END) AS count_customer_order_done, 
+                                SUM(CASE WHEN T1.order_status != 'done' THEN 1 ELSE 0 END) AS count_customer_order_not_done,
+                                T1.report_customer_period AS report_customer_period
+                                FROM (
+                                    SELECT     -- в этой выборке достаём из DWH обновлённые или новые данные по мастерам, которые уже есть в витрине
+                                            dcs.customer_id AS customer_id,
+            dcs.customer_name AS customer_name,
+            dcs.customer_address AS customer_address,
+            dcs.customer_birthday AS customer_birthday,
+            dcs.customer_email AS customer_email,
+            fo.order_id AS order_id,
+            dp.product_id AS product_id,
+            dp.product_price AS product_price,
+            dp.product_type AS product_type,
+            dc.craftsman_id as craftsman_id,
+            fo.order_completion_date - fo.order_created_date AS diff_order_date, 
+            fo.order_status AS order_status,
+            TO_CHAR(fo.order_created_date, 'yyyy-mm') AS report_customer_period
+                                           FROM dwh.f_order fo 
+                                                INNER JOIN dwh.d_craftsman dc ON fo.craftsman_id = dc.craftsman_id 
+                                                INNER JOIN dwh.d_customer dcs ON fo.customer_id = dcs.customer_id 
+                                                INNER JOIN dwh.d_product dp ON fo.product_id = dp.product_id
+                                                INNER JOIN dwh_update_delta ud ON fo.customer_id = ud.customer_id
+                                ) AS T1
+                                    GROUP BY T1.customer_id, T1.customer_name, T1.customer_address, T1.customer_birthday, T1.customer_email, T1.report_customer_period
+                            ) as T2 INNER JOIN (
+                                    SELECT dd.customer_id AS customer_id_for_product_type, 
+                                            dd.product_type, 
+                                            COUNT(dd.product_id) AS count_product
+                                            FROM dwh_customer_delta AS dd
+                                                GROUP BY dd.customer_id, dd.product_type
+                                                    ORDER BY count_product DESC) AS T3 ON T2.customer_id = T3.customer_id_for_product_type
+                
+                inner join ( select craftsman_id as top_craftsman_customer,top_craftsman_customer_id  from (
+                SELECT                                             tt.customer_id AS top_craftsman_customer_id, 
+                                            tt.craftsman_id, 
+                                            row_number () over (partition by customer_id order by count(*) desc) AS top_craftsman
+                                            FROM dwh_customer_delta AS tt
+                                                GROUP BY tt.customer_id, tt.craftsman_id
+                                                    ORDER by top_craftsman  desc) yy
+                                                    where top_craftsman=1
+                                                    ) AS T5 ON T2.customer_id = T5.top_craftsman_customer_id)
+                 AS T4 WHERE T4.top_product_customer_category = 1 ORDER BY report_customer_period
+),
+insert_delta AS ( -- выполняем insert новых расчитанных данных для витрины 
+    INSERT INTO dwh.customer_report_datamart (
+        	customer_id,
+            customer_name,
+            customer_address,
+            customer_birthday,
+            customer_email,
+            customer_money,
+            platform_customer_money,
+            count_customer_order,
+            avg_price_customer_order,
+           	top_product_customer_category,
+            top_craftsman_customer,
+            median_time_customer_order_completed,
+            count_customer_order_created,
+            count_customer_order_in_progress,
+            count_customer_order_delivery,
+            count_customer_order_done,
+            count_customer_order_not_done,
+            report_customer_period 
+            
+    ) SELECT 
+            customer_id,
+            customer_name,
+            customer_address,
+            customer_birthday,
+            customer_email,
+            customer_money,
+            platform_customer_money,
+            count_customer_order,
+            avg_price_customer_order,
+           	top_product_customer_category,
+            top_craftsman_customer,
+            median_time_customer_order_completed,
+            count_customer_order_created,
+            count_customer_order_in_progress,
+            count_customer_order_delivery,
+            count_customer_order_done,
+            count_customer_order_not_done,
+            report_customer_period 
+            FROM dwh_delta_insert_result
+),
+update_delta AS ( -- выполняем обновление показателей в отчёте по уже существующим мастерам
+    UPDATE dwh.customer_report_datamart SET
+        	customer_id=up.customer_id,
+            customer_name=up.customer_name,
+            customer_address=up.customer_address,
+            customer_birthday=up.customer_birthday,
+            customer_email=up.customer_email,
+            customer_money=up.customer_money,
+            platform_customer_money=up.platform_customer_money,
+            count_customer_order=up.count_customer_order,
+            avg_price_customer_order=up.avg_price_customer_order,
+           	top_product_customer_category=up.top_product_customer_category,
+            top_craftsman_customer=up.top_craftsman_customer,
+            median_time_customer_order_completed=up.median_time_customer_order_completed,
+            count_customer_order_created=up.count_customer_order_created,
+            count_customer_order_in_progress=up.count_customer_order_in_progress,
+            count_customer_order_delivery=up.count_customer_order_delivery,
+            count_customer_order_done=up.count_customer_order_done,
+            count_customer_order_not_done=up.count_customer_order_not_done,
+            report_customer_period=up.report_customer_period
+    FROM (
+        SELECT 
+            customer_id,
+            customer_name,
+            customer_address,
+            customer_birthday,
+            customer_email,
+            customer_money,
+            platform_customer_money,
+            count_customer_order,
+            avg_price_customer_order,
+           	top_product_customer_category,
+            top_craftsman_customer,
+            median_time_customer_order_completed,
+            count_customer_order_created,
+            count_customer_order_in_progress,
+            count_customer_order_delivery,
+            count_customer_order_done,
+            count_customer_order_not_done,
+            report_customer_period  
+            FROM dwh_delta_update_result) AS up
+    WHERE dwh.customer_report_datamart.customer_id = up.customer_id
+),
+insert_load_date AS ( -- делаем запись в таблицу загрузок о том, когда была совершена загрузка, чтобы в следующий раз взять данные, которые будут добавлены или изменены после этой даты
+    INSERT INTO dwh.load_dates_customer_report_datamart (
+        load_dttm
+    )
+    SELECT GREATEST(COALESCE(MAX(craftsman_load_dttm), NOW()), 
+                    COALESCE(MAX(customers_load_dttm), NOW()), 
+                    COALESCE(MAX(products_load_dttm), NOW())) 
+        FROM dwh_customer_delta)
+SELECT 'increment datamart'; -- инициализируем запрос CTE
  
